@@ -1,8 +1,9 @@
-// #include <openssl/evp.h>
+#include "../encrypt.h"
+#include <openssl/evp.h>
 #include <openssl/rand.h>
-// #include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
-// #include <string.h>
+#include <string.h>
 
 #define KEY_LENGTH 32 // Longueur de la clé pour AES-256
 #define IV_LENGTH 16  // Longueur du vecteur d'initialisation pour AES

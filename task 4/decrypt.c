@@ -1,85 +1,116 @@
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define KEY_LENGTH 32 // Longueur de la clé pour AES-256
-#define IV_LENGTH 16  // Longueur du vecteur d'initialisation pour AES
-#define BUFFER_SIZE 1024
+#define ITERATIONS 10000
+#define KEY_LENGTH 32
+#define SALT_LENGTH 16
+#define BUFFER_SIZE 4096
 
-// Fonction pour convertir une chaîne hexadécimale en tableau d'octets
-void hex_to_bytes(const char *hex, unsigned char *bytes) {
-    for (size_t i = 0; i < strlen(hex) / 2; i++) {
-        sscanf(hex + 2 * i, "%2hhx", &bytes[i]);
-    }
-}
-
-// Fonction pour déchiffrer le fichier
-int decrypt_file(const char *input_file, const char *output_file, const unsigned char *key) {
-    FILE *in = fopen(input_file, "rb");
-    FILE *out = fopen(output_file, "wb");
-    if (!in || !out) {
-        perror("Échec d'ouverture du fichier");
+int verify_and_decrypt(const char *input_path, const char *output_path, const char *password) {
+    // Lecture du keystore
+    FILE *keystore = fopen("keystore.bin", "rb");
+    if (!keystore) {
+        perror("Keystore introuvable");
         return 0;
     }
 
-    // Lire l'IV depuis le début du fichier
-    unsigned char iv[IV_LENGTH];
-    fread(iv, sizeof(iv), 1, in);
+    unsigned char salt[SALT_LENGTH], stored_hmac[EVP_MAX_MD_SIZE];
+    fread(salt, 1, SALT_LENGTH, keystore);
+    size_t hmac_len = fread(stored_hmac, 1, EVP_MAX_MD_SIZE, keystore);
+    fclose(keystore);
+
+    // Dérivation de la clé
+    unsigned char key[KEY_LENGTH];
+    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LENGTH, ITERATIONS, EVP_sha256(), KEY_LENGTH, key);
+
+    // Vérification du HMAC
+    FILE *in = fopen(input_path, "rb");
+    if (!in) {
+        perror("Erreur d'ouverture du fichier chiffré");
+        memset(key, 0, KEY_LENGTH);
+        return 0;
+    }
+
+    unsigned char iv[EVP_MAX_IV_LENGTH];
+    fread(iv, 1, EVP_MAX_IV_LENGTH, in);
+
+    // HMAC moderne OpenSSL 3.0+
+    EVP_MAC *hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *hmac_ctx = EVP_MAC_CTX_new(hmac);
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0),
+        OSSL_PARAM_construct_end()
+    };
+    EVP_MAC_init(hmac_ctx, key, KEY_LENGTH, params);
+    EVP_MAC_update(hmac_ctx, iv, EVP_MAX_IV_LENGTH);
+
+    unsigned char in_buf[BUFFER_SIZE], computed_hmac[EVP_MAX_MD_SIZE];
+    size_t len;
+
+    while ((len = fread(in_buf, 1, BUFFER_SIZE, in)) > 0) {
+        EVP_MAC_update(hmac_ctx, in_buf, len);
+    }
+
+    size_t computed_hmac_len;
+    EVP_MAC_final(hmac_ctx, computed_hmac, &computed_hmac_len, sizeof(computed_hmac));
+    EVP_MAC_CTX_free(hmac_ctx);
+    EVP_MAC_free(hmac);
+
+    if (hmac_len != computed_hmac_len || memcmp(stored_hmac, computed_hmac, hmac_len) != 0) {
+        fprintf(stderr, "Erreur: Le fichier a été modifié!\n");
+        fclose(in);
+        memset(key, 0, KEY_LENGTH);
+        return 0;
+    }
+
+    // Déchiffrement
+    rewind(in);
+    fread(iv, 1, EVP_MAX_IV_LENGTH, in);
+    
+    FILE *out = fopen(output_path, "wb");
+    if (!out) {
+        perror("Erreur de création du fichier de sortie");
+        fclose(in);
+        memset(key, 0, KEY_LENGTH);
+        return 0;
+    }
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        fprintf(stderr, "Échec de la création du contexte.\n");
-        fclose(in);
-        fclose(out);
-        return 0;
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv);
+
+    unsigned char out_buf[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
+    int out_len;
+
+    while ((len = fread(in_buf, 1, BUFFER_SIZE, in)) > 0) {
+        EVP_DecryptUpdate(ctx, out_buf, &out_len, in_buf, len);
+        fwrite(out_buf, 1, out_len, out);
     }
 
-    // Initialiser le déchiffrement
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
-        fprintf(stderr, "Échec de l'initialisation du déchiffrement.\n");
-        EVP_CIPHER_CTX_free(ctx);
-        fclose(in);
-        fclose(out);
-        return 0;
-    }
+    EVP_DecryptFinal_ex(ctx, out_buf, &out_len);
+    fwrite(out_buf, 1, out_len, out);
 
-    unsigned char buffer[BUFFER_SIZE];
-    unsigned char plaintext[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
-    int len;
-    int plaintext_len = 0;
-
-    // Déchiffrer le fichier d'entrée
-    while (1) {
-        size_t read = fread(buffer, 1, sizeof(buffer), in);
-        if (read <= 0) break;
-
-        if (EVP_DecryptUpdate(ctx, plaintext + plaintext_len, &len, buffer, read) != 1) {
-            fprintf(stderr, "Échec du déchiffrement.\n");
-            EVP_CIPHER_CTX_free(ctx);
-            fclose(in);
-            fclose(out);
-            return 0;
-        }
-        plaintext_len += len;
-    }
-
-    // Finaliser le déchiffrement
-    if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) != 1) {
-        fprintf(stderr, "Échec du déchiffrement : remplissage invalide.\n");
-        EVP_CIPHER_CTX_free(ctx);
-        fclose(in);
-        fclose(out);
-        return 0;
-    }
-    plaintext_len += len;
-
-    // Écrire le contenu déchiffré dans le fichier de sortie
-    fwrite(plaintext, 1, plaintext_len, out);
-
+    // Nettoyage
     EVP_CIPHER_CTX_free(ctx);
     fclose(in);
     fclose(out);
-    return 1; // Succès
+    memset(key, 0, KEY_LENGTH);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <input> <output> <password>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (verify_and_decrypt(argv[1], argv[2], argv[3])) {
+        printf("Fichier déchiffré avec succès.\n");
+        return EXIT_SUCCESS;
+    } else {
+        printf("Échec: Fichier corrompu ou mot de passe incorrect.\n");
+        return EXIT_FAILURE;
+    }
 }

@@ -1,61 +1,104 @@
-// #include <openssl/evp.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
-// #include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
-// #include <string.h>
+#include <string.h>
 
-#define KEY_LENGTH 32 // Longueur de la clé pour AES-256
-#define IV_LENGTH 16  // Longueur du vecteur d'initialisation pour AES
-#define BUFFER_SIZE 1024
+#define ITERATIONS 10000
+#define KEY_LENGTH 32
+#define SALT_LENGTH 16
+#define BUFFER_SIZE 4096
 
-// Fonction pour crypter le fichier
-void encrypt_file(const char *input_file, const char *output_file, const unsigned char *key) {
-    FILE *in = fopen(input_file, "rb");
-    FILE *out = fopen(output_file, "wb");
+void derive_key(const char *password, const unsigned char *salt, unsigned char *key) {
+    PKCS5_PBKDF2_HMAC(password, strlen(password), salt, SALT_LENGTH, ITERATIONS, EVP_sha256(), KEY_LENGTH, key);
+}
+
+void encrypt_file(const char *input_path, const char *output_path, const char *password) {
+    // Génération du sel
+    unsigned char salt[SALT_LENGTH];
+    if (!RAND_bytes(salt, SALT_LENGTH)) {
+        fprintf(stderr, "Erreur de génération du sel\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Dérivation de la clé
+    unsigned char key[KEY_LENGTH];
+    derive_key(password, salt, key);
+
+    // Initialisation du chiffrement
+    unsigned char iv[EVP_MAX_IV_LENGTH];
+    if (!RAND_bytes(iv, EVP_MAX_IV_LENGTH)) {
+        fprintf(stderr, "Erreur de génération de l'IV\n");
+        exit(EXIT_FAILURE);
+    }
+
+    FILE *in = fopen(input_path, "rb");
+    FILE *out = fopen(output_path, "wb");
     if (!in || !out) {
-        perror("Échec d'ouverture du fichier");
-        return;
+        perror("Erreur d'ouverture de fichier");
+        exit(EXIT_FAILURE);
     }
 
-    // Générer un vecteur d'initialisation aléatoire
-    unsigned char iv[IV_LENGTH];
-    if (!RAND_bytes(iv, sizeof(iv))) {
-        fprintf(stderr, "Erreur lors de la génération du IV.\n");
-        fclose(in);
-        fclose(out);
-        return;
-    }
+    // Écriture de l'IV
+    fwrite(iv, 1, EVP_MAX_IV_LENGTH, out);
 
-    // Écrire le IV dans le fichier de sortie
-    fwrite(iv, sizeof(iv), 1, out);
-
+    // Configuration du chiffrement
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv);
 
-    unsigned char buffer[BUFFER_SIZE];
-    unsigned char ciphertext[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
-    int len;
+    // Configuration du HMAC (version moderne OpenSSL 3.0+)
+    EVP_MAC *hmac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *hmac_ctx = EVP_MAC_CTX_new(hmac);
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0),
+        OSSL_PARAM_construct_end()
+    };
+    EVP_MAC_init(hmac_ctx, key, KEY_LENGTH, params);
 
-    while (1) {
-        size_t read = fread(buffer, 1, sizeof(buffer), in);
-        if (read <= 0) break;
+    // Mise à jour du HMAC avec l'IV
+    EVP_MAC_update(hmac_ctx, iv, EVP_MAX_IV_LENGTH);
 
-        EVP_EncryptUpdate(ctx, ciphertext, &len, buffer, read);
-        fwrite(ciphertext, 1, len, out);
+    // Chiffrement et calcul du HMAC
+    unsigned char in_buf[BUFFER_SIZE], out_buf[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
+    int len, out_len;
+
+    while ((len = fread(in_buf, 1, BUFFER_SIZE, in)) > 0) {
+        EVP_EncryptUpdate(ctx, out_buf, &out_len, in_buf, len);
+        fwrite(out_buf, 1, out_len, out);
+        EVP_MAC_update(hmac_ctx, out_buf, out_len);
     }
 
-    EVP_EncryptFinal_ex(ctx, ciphertext, &len);
-    fwrite(ciphertext, 1, len, out);
+    EVP_EncryptFinal_ex(ctx, out_buf, &out_len);
+    fwrite(out_buf, 1, out_len, out);
+    EVP_MAC_update(hmac_ctx, out_buf, out_len);
 
+    // Finalisation du HMAC
+    size_t hmac_len;
+    unsigned char hmac_value[EVP_MAX_MD_SIZE];
+    EVP_MAC_final(hmac_ctx, hmac_value, &hmac_len, sizeof(hmac_value));
+
+    // Stockage du keystore
+    FILE *keystore = fopen("keystore.bin", "wb");
+    fwrite(salt, 1, SALT_LENGTH, keystore);
+    fwrite(hmac_value, 1, hmac_len, keystore);
+    fclose(keystore);
+
+    // Nettoyage
     EVP_CIPHER_CTX_free(ctx);
+    EVP_MAC_CTX_free(hmac_ctx);
+    EVP_MAC_free(hmac);
     fclose(in);
     fclose(out);
+    memset(key, 0, KEY_LENGTH);
 }
 
-// Fonction pour générer une clé aléatoire
-void generate_key(unsigned char *key) {
-    if (!RAND_bytes(key, KEY_LENGTH)) {
-        fprintf(stderr, "Erreur lors de la génération de la clé.\n");
-        exit(1);
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <input> <output> <password>\n", argv[0]);
+        return EXIT_FAILURE;
     }
+    encrypt_file(argv[1], argv[2], argv[3]);
+    printf("Fichier chiffré avec succès.\n");
+    return EXIT_SUCCESS;
 }
